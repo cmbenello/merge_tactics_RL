@@ -55,12 +55,15 @@ class Unit:
                 return cat[s]
         # Iterable list/tuple
         if isinstance(cat, (list, tuple)):
-            for x in cat:
+            for idx, x in enumerate(cat):
                 # object with .id
                 if hasattr(x, 'id') and getattr(x, 'id') == card_id:
                     return x
                 # dict with 'id'
                 if isinstance(x, dict) and str(x.get('id')) == str(card_id):
+                    return x
+                # fallback: list index is the id
+                if idx == card_id:
                     return x
         return None
 

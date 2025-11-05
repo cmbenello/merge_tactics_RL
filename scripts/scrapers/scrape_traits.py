@@ -15,7 +15,7 @@ Zero-config usage:
 """
 from __future__ import annotations
 import json, os, re, sys, time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -92,13 +92,15 @@ def normalize_trait_name(name: str) -> str:
     n = re.sub(r"(?i)^category:\s*", "", n)
     return n.strip().title()
 
-def extract_cards_from_trait_category(trait_cat_url: str) -> List[Tuple[str,str]]:
+def extract_cards_from_trait_category(trait_cat_url: str, first_soup: Optional[BeautifulSoup] = None) -> List[Tuple[str,str]]:
     """Extract card pages listed under a trait subcategory (with pagination)."""
     cards: List[Tuple[str,str]] = []
     url, seen = trait_cat_url, set()
+    soup = first_soup
     while url and url not in seen:
         seen.add(url)
-        soup = fetch(url)
+        if soup is None:
+            soup = fetch(url)
         for a in soup.select("a.category-page__member-link[href]"):
             href = a["href"]
             if "/wiki/Category:" in href:
@@ -107,6 +109,7 @@ def extract_cards_from_trait_category(trait_cat_url: str) -> List[Tuple[str,str]
             cards.append((name, urljoin(BASE, href)))
         nxt = soup.select_one("a[rel='next'], a.category-page__pagination-next")
         url = urljoin(BASE, nxt["href"]) if nxt and nxt.get("href") else None
+        soup = None
         time.sleep(SLEEP)
     # de-dup by URL
     out, seen2 = [], set()
@@ -149,13 +152,55 @@ def _maybe_follow_trait_page_from_category(soup_cat: BeautifulSoup) -> str | Non
             return urljoin(BASE, href)
     return None
 
-def extract_trait_description(trait_url: str) -> str:
+def _css_color_to_hex(val: str) -> Optional[str]:
+    if not val:
+        return None
+    m = re.search(r"#([0-9a-fA-F]{6})", val)
+    if m:
+        return f"#{m.group(1).upper()}"
+    m = re.search(r"#([0-9a-fA-F]{3})", val)
+    if m:
+        c = m.group(1).upper()
+        return f"#{c[0]*2}{c[1]*2}{c[2]*2}"
+    m = re.search(r"rgba?\(([^)]+)\)", val)
+    if m:
+        parts = [p.strip() for p in m.group(1).split(",")]
+        if len(parts) >= 3:
+            try:
+                r, g, b = [int(float(parts[i])) for i in range(3)]
+                r = max(0, min(255, r))
+                g = max(0, min(255, g))
+                b = max(0, min(255, b))
+                return "#{:02X}{:02X}{:02X}".format(r, g, b)
+            except Exception:
+                return None
+    return None
+
+def _extract_trait_color_from_soup(soup: BeautifulSoup) -> Optional[str]:
+    for el in soup.select("[style]"):
+        style = el.get("style") or ""
+        for prop in ("background-color", "color", "border-color"):
+            m = re.search(rf"{prop}\s*:\s*([^;]+)", style, re.I)
+            if not m:
+                continue
+            hexcol = _css_color_to_hex(m.group(1))
+            if hexcol:
+                return hexcol
+    # Try looking for css variables stored in data attributes
+    for attr in ("data-color", "data-colour", "data-bgcolor", "data-background"):
+        for el in soup.select(f"[{attr}]"):
+            hexcol = _css_color_to_hex(el.get(attr, ""))
+            if hexcol:
+                return hexcol
+    return None
+
+def extract_trait_description(trait_url: str, soup_cat: Optional[BeautifulSoup] = None) -> str:
     """
     Best-effort: try the trait category page; if that fails, follow to a 'Trait: X' page;
     return first meaningful paragraph.
     """
     # 1) look on the category page itself
-    soup_cat = fetch(trait_url)
+    soup_cat = soup_cat or fetch(trait_url)
     text = _first_meaningful_paragraph(soup_cat)
     if text:
         return text
@@ -173,6 +218,22 @@ def extract_trait_description(trait_url: str) -> str:
     heading = norm_space(head.get_text(" ")) if head else ""
     return f"{heading} (no description found)"
 
+def extract_trait_color(trait_url: str, soup_cat: Optional[BeautifulSoup] = None) -> Optional[str]:
+    soup_cat = soup_cat or fetch(trait_url)
+    color = _extract_trait_color_from_soup(soup_cat)
+    if color:
+        return color
+    linked = _maybe_follow_trait_page_from_category(soup_cat)
+    if linked:
+        try:
+            soup_trait = fetch(linked)
+            color = _extract_trait_color_from_soup(soup_trait)
+            if color:
+                return color
+        except Exception:
+            pass
+    return None
+
 # ------------------------
 # main
 # ------------------------
@@ -187,12 +248,17 @@ def main():
     for i, (raw_trait, url) in enumerate(subcats, 1):
         trait = normalize_trait_name(raw_trait)
         try:
-            desc = extract_trait_description(url)
-            cards = extract_cards_from_trait_category(url)
-            traits_index[trait] = {
+            soup_cat = fetch(url)
+            desc = extract_trait_description(url, soup_cat=soup_cat)
+            color = extract_trait_color(url, soup_cat=soup_cat)
+            cards = extract_cards_from_trait_category(url, first_soup=soup_cat)
+            entry = {
                 "description": desc,
                 "cards": [{"name": n, "url": u} for (n, u) in cards],
             }
+            if color:
+                entry["color"] = color
+            traits_index[trait] = entry
             for (n, _u) in cards:
                 card_to_traits.setdefault(n, set()).add(trait)
             print(f"[{i}/{len(subcats)}] {trait}: {len(cards)} cards", file=sys.stderr)

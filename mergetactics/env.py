@@ -16,15 +16,142 @@ def _has_from_card() -> bool:
 def _has_bind_catalog() -> bool:
     return hasattr(Unit, "bind_catalog")
 
+# Pull per-card stats from the active catalog and push them onto the Unit instance
+# so instance attributes shadow class methods (e.g., range(), hit_speed()).
+# This ensures data-driven ranged/melee and projectiles behave correctly.
+
+def _catalog_get(id_: int):
+    cat = getattr(rules, "CARD_CATALOG", None)
+    if cat is None:
+        return None
+    # Support both mapping-like .get and dict-like indexing
+    try:
+        spec = cat.get(id_)
+        if spec is not None:
+            return spec
+    except Exception:
+        pass
+    try:
+        return cat[id_]
+    except Exception:
+        return None
+
+
+def _apply_catalog_stats(u: Unit, id_: int):
+    """Read fields from catalog entry and assign instance-level callables so they
+    override class methods. Supports dicts or objects with attributes. Numeric-like
+    dicts {"value": x, ...} are coerced to float."""
+    spec = _catalog_get(id_)
+    if spec is None:
+        return
+
+    star = int(getattr(u, "star", 1))
+
+    def _get(spec, key):
+        # works for object attributes or dict keys
+        try:
+            if hasattr(spec, key):
+                return getattr(spec, key)
+        except Exception:
+            pass
+        try:
+            return spec[key]
+        except Exception:
+            return None
+
+    def _numish(v):
+        try:
+            if isinstance(v, dict) and "value" in v:
+                return float(v["value"])
+            return float(v)
+        except Exception:
+            return None
+
+    def _set_callable(name: str, raw):
+        if raw is None:
+            return None
+        val = _numish(raw)
+        if val is None:
+            return None
+        # Make it an instance-level callable (e.g., u.range()) that returns val
+        try:
+            setattr(u, name, (lambda vv=val: vv))
+            return val
+        except Exception:
+            try:
+                setattr(u, name, val)
+                return val
+            except Exception:
+                return None
+
+    # Dict-like specs: prefer rule helpers (per-level, star-aware)
+    if isinstance(spec, dict):
+        hp_val, dps_val = rules.base_stats_for(spec, star)
+        try:
+            u.hp = float(hp_val)
+        except Exception:
+            pass
+
+        rng = _set_callable("range", rules.range_for(spec))
+        hs = _set_callable("hit_speed", rules.hit_speed_for(spec))
+        dmg = _set_callable("damage", rules.damage_for(spec, star))
+        dps = _set_callable("dps", dps_val)
+
+        ps_val = rules.projectile_speed_for(spec)
+        if ps_val > 0:
+            _set_callable("projectile_speed", ps_val)
+        else:
+            try:
+                effective_range = float(rng) if rng is not None else float(getattr(u, "range", lambda: 1)())
+            except Exception:
+                effective_range = 1.0
+            if effective_range > 1.0:
+                default_ps = float(getattr(rules, "DEFAULT_PROJECTILE_SPEED", 6.0))
+                _set_callable("projectile_speed", default_ps)
+        return
+
+    # Fallback for object-like specs without dict access
+    # Apply in this order so DPS can be derived from damage/hit_speed if missing
+    rng = _set_callable("range", _get(spec, "range"))
+    hs  = _set_callable("hit_speed", _get(spec, "hit_speed"))
+    dmg = _set_callable("damage", _get(spec, "damage"))
+    dps = _set_callable("dps", _get(spec, "dps"))
+
+    # Derive DPS if not present
+    if (dps is None or dps <= 0) and dmg is not None and hs is not None and hs > 0:
+        _set_callable("dps", float(dmg) / float(hs))
+
+    # Projectile speed: trust catalog if present; else default for ranged
+    ps_raw = _get(spec, "projectile_speed")
+    ps = _numish(ps_raw) if ps_raw is not None else None
+    if ps is not None and ps > 0:
+        _set_callable("projectile_speed", ps)
+    else:
+        # if range > 1, assume ranged even if ps missing/zero
+        try:
+            effective_range = float(rng) if rng is not None else float(getattr(u, "range", lambda: 1)())
+        except Exception:
+            effective_range = 1.0
+        if effective_range > 1.0:
+            default_ps = float(getattr(rules, "DEFAULT_PROJECTILE_SPEED", 6.0))
+            _set_callable("projectile_speed", default_ps)
+
 def _unit_make(card_or_troop_id: int, star: int, pos: Tuple[int, int]) -> Unit:
     """
     Instantiate a Unit using from_card if available (data-driven),
-    otherwise fall back to from_troop (legacy).
+    otherwise fall back to from_troop (legacy). Then coerce combat numbers.
     """
     if _has_from_card():
-        return Unit.from_card(card_id=card_or_troop_id, star=star, pos=pos)
+        u = Unit.from_card(card_id=card_or_troop_id, star=star, pos=pos)
     else:
-        return Unit.from_troop(troop_id=card_or_troop_id, star=star, pos=pos)
+        u = Unit.from_troop(troop_id=card_or_troop_id, star=star, pos=pos)
+    # Push catalog stats (range/hit_speed/damage/dps/projectile_speed) onto the instance
+    try:
+        _apply_catalog_stats(u, int(card_or_troop_id))
+    except Exception:
+        pass
+    _ensure_combat_numbers(u)
+    return u
 
 def _unit_id(u: Any) -> int:
     """Return the integer id for a unit for board encoding (card_id or troop_id)."""
@@ -46,6 +173,81 @@ def _cost_of(id_: int, env_catalog) -> int:
         except Exception:
             pass
     return int(rules.CARD_COST_DEFAULT)
+
+# -------------------------
+# Numeric & combat coercion helpers
+# -------------------------
+
+def _num(val, default=0.0):
+    """Coerce floats/ints or dicts like {"value": x, ...} into a float."""
+    try:
+        if callable(val):
+            val = val()
+        if isinstance(val, dict) and "value" in val:
+            return float(val["value"])
+        return float(val)
+    except Exception:
+        return float(default)
+
+def _ensure_combat_numbers(u: Unit):
+    """Ensure Unit has coherent range/projectile_speed/dps numerics.
+    - Treat range>1 as ranged even if projectile_speed is missing/0
+    - Default projectile_speed to rules.DEFAULT_PROJECTILE_SPEED for ranged
+    - Compute dps from damage/hit_speed if missing
+    """
+    # Range as tiles
+    try:
+        rng_tiles = _num(getattr(u, "range", 1), 1)
+    except Exception:
+        rng_tiles = 1.0
+
+    # Hit speed seconds
+    hs = _num(getattr(u, "hit_speed", 1.0), 1.0)
+    if hs <= 0:
+        hs = 1.0
+
+    # DPS sanity
+    try:
+        dps_val = _num(getattr(u, "dps", 0.0), 0.0)
+    except Exception:
+        dps_val = 0.0
+    if dps_val <= 0.0:
+        dmg = _num(getattr(u, "damage", 0.0), 0.0)
+        if hs > 0:
+            dps_val = dmg / hs if dmg > 0 else 0.0
+        try:
+            setattr(u, "dps", dps_val)
+        except Exception:
+            pass
+
+    # Projectile speed coercion
+    try:
+        ps = _num(getattr(u, "projectile_speed", 0.0), 0.0)
+    except Exception:
+        ps = 0.0
+
+    is_ranged = rng_tiles > 1.0
+    if is_ranged and ps <= 0.0:
+        default_ps = float(getattr(rules, "DEFAULT_PROJECTILE_SPEED", 6.0))
+        # Attach/override an instance-level projectile_speed() that returns default_ps
+        try:
+            setattr(u, "projectile_speed", (lambda v=default_ps: v))
+            ps = default_ps
+        except Exception:
+            pass
+
+    # Optional debug
+    if getattr(rules, "DEBUG_RANGED", False):
+        try:
+            tid = int(getattr(u, "card_id", getattr(u, "troop_id", -1)))
+        except Exception:
+            tid = -1
+        name = None
+        try:
+            name = getattr(rules, "TROOP_NAMES", {}).get(tid)
+        except Exception:
+            name = None
+        print(f"[MT DEBUG] unit id={tid} name={name} range={rng_tiles} ps={ps} dps={dps_val} (ranged={is_ranged})")
 
 # -------------------------
 # Runtime structs
@@ -75,6 +277,20 @@ class PlayerState:
 class BattleEngine:
     units: list
     projectiles: list = field(default_factory=list)
+
+    # ---- numeric coercion helper ----
+    @staticmethod
+    def _num(val, default=0.0):
+        """
+        Coerce values that may be floats, ints, or dicts like
+        {"value": x, "unit": "..."} into a float. Falls back to `default`.
+        """
+        try:
+            if isinstance(val, dict) and "value" in val:
+                return float(val["value"])
+            return float(val)
+        except Exception:
+            return float(default)
 
     def nearest_enemy(self, idx: int) -> int | None:
         """
@@ -169,21 +385,21 @@ class BattleEngine:
             sr, sc = u.pos
             dr = trf - sr
             dc = tcf - sc
-            # smooth slide towards center (no axis snapping)
             spd = u.move_speed()
-            step = min(spd * dt, 0.45)  # cap so we never cross a hex in one frame
-            L1 = abs(dr) + abs(dc)
-            if L1 < CENTER_EPS:
+            # Euclidean distance to target center
+            dist = (dr*dr + dc*dc) ** 0.5
+            if dist < CENTER_EPS:
                 u.pos = (trf, tcf)
                 u.move_target = None
                 return True
-            ratio = min(1.0, step / max(L1, 1e-6))
-            u.pos = (sr + dr * ratio, sc + dc * ratio)
-            # arrived?
-            if abs(u.pos[0] - trf) + abs(u.pos[1] - tcf) < CENTER_EPS:
+            # step distance this frame; clamp so we never overshoot target
+            step = max(0.0, spd * dt)
+            if step >= dist:
                 u.pos = (trf, tcf)
                 u.move_target = None
                 return True
+            # move along the line towards target (smooth slide)
+            u.pos = (sr + dr * (step / dist), sc + dc * (step / dist))
             return False
 
         # current occupancy (alive or dead)
@@ -234,20 +450,25 @@ class BattleEngine:
             tj = self.units[t_idx][1]
             tr, tc = round(tj.pos[0]), round(tj.pos[1])
             d0 = hex_dist(ur, uc, tr, tc)
-            if d0 <= ui.range():
+            raw_range = getattr(ui, "range", 1)
+            rng_tiles = self._num(raw_range() if callable(raw_range) else raw_range, 1)
+            if d0 <= rng_tiles:
                 intents[i] = None
                 continue
 
             rb, cb = owner_bias(owner)
+            lane_pref = 1 if ((ur + uc + tr + tc) & 1) == 0 else -1
             def bias_key(rc: tuple[int,int]):
                 rr, cc = rc
-                return (rb * (rr - ur), cb * (cc - uc))
+                forward = rb * (rr - ur)
+                lateral = lane_pref * (cc - uc)
+                return (forward, lateral, cc, rr)
 
             neigh = [n for n in hex_neighbors(ur, uc) if n not in occupied]
             reducing = [n for n in neigh if hex_dist(n[0], n[1], tr, tc) < d0]
             lateral = [n for n in neigh if hex_dist(n[0], n[1], tr, tc) == d0]
-            reducing.sort(key=lambda rc: (hex_dist(rc[0], rc[1], tr, tc), bias_key(rc), rc[1], rc[0]))
-            lateral.sort(key=lambda rc: (abs(rc[0]-tr)+abs(rc[1]-tc), bias_key(rc), rc[1], rc[0]))
+            reducing.sort(key=lambda rc: (hex_dist(rc[0], rc[1], tr, tc), bias_key(rc)))
+            lateral.sort(key=lambda rc: (abs(rc[0]-tr)+abs(rc[1]-tc), bias_key(rc)))
             ordered = reducing + lateral
             ordered_options[i] = ordered
             intents[i] = ordered[0] if ordered else None
@@ -368,21 +589,56 @@ class BattleEngine:
                 continue
             if not is_center(ui) or (hasattr(ui, "move_target") and ui.move_target is not None):
                 continue
+
             t_idx = self.nearest_enemy(i)
             if t_idx is None:
                 continue
             tj = self.units[t_idx][1]
+
             ur, uc = round(ui.pos[0]), round(ui.pos[1])
             tr, tc = round(tj.pos[0]), round(tj.pos[1])
-            if hex_dist(ur, uc, tr, tc) <= ui.range():
-                dmg = ui.dps * dt
-                ps = ui.projectile_speed()
-                if rules.USE_PROJECTILES and ps > 0:
-                    travel = max(0.0, hex_dist(ur, uc, tr, tc) / ps)
-                    self.projectiles.append(Projectile(owner=owner, dmg=dmg, r=ui.pos[0], c=ui.pos[1], target_idx=t_idx, remaining=travel))
+
+            # Use hex range, allowing for catalog dicts like {"value": 3, "unit": "tiles"}
+            raw_range = getattr(ui, "range", 1)
+            rng_tiles = self._num(raw_range() if callable(raw_range) else raw_range, 1)
+
+            if hex_dist(ur, uc, tr, tc) <= rng_tiles:
+                dps_attr = getattr(ui, "dps", 0.0)
+                dps_val = self._num(dps_attr() if callable(dps_attr) else dps_attr, 0.0)
+                dmg_attr = getattr(ui, "damage", None)
+                dmg_val = self._num(dmg_attr() if callable(dmg_attr) else dmg_attr, 0.0) if dmg_attr is not None else 0.0
+                hs_attr = getattr(ui, "hit_speed", 1.0)
+                hit_interval = max(0.05, self._num(hs_attr() if callable(hs_attr) else hs_attr, 1.0))
+                if dmg_val <= 0.0:
+                    dmg_val = dps_val * hit_interval
+
+                # Consider unit ranged if range>1 even if projectile_speed is missing/zero.
+                # Fall back to rules.DEFAULT_PROJECTILE_SPEED when necessary.
+                raw_ps_attr = getattr(ui, "projectile_speed", None)
+                ps_val = self._num(raw_ps_attr() if callable(raw_ps_attr) else raw_ps_attr, 0)
+                is_ranged = (rng_tiles > 1.0)
+                if is_ranged and ps_val <= 0.0 and getattr(rules, "USE_PROJECTILES", True):
+                    ps_val = float(getattr(rules, "DEFAULT_PROJECTILE_SPEED", 6.0))
+
+                if getattr(rules, "USE_PROJECTILES", True) and ps_val > 0.0:
+                    # travel time in "tiles" divided by tiles/second (ps)
+                    travel = max(0.0, hex_dist(ur, uc, tr, tc) / ps_val)
+                    self.projectiles.append(
+                        Projectile(
+                            owner=owner,
+                            dmg=dmg_val,
+                            r=ui.pos[0],
+                            c=ui.pos[1],
+                            target_idx=t_idx,
+                            remaining=travel,
+                        )
+                    )
                 else:
-                    tj.hp -= dmg
-                ui.cooldown = ui.hit_speed()
+                    # melee: apply damage immediately
+                    tj.hp -= dmg_val
+
+                # Attack cooldown from catalog hit_speed (already seconds per hit)
+                ui.cooldown = hit_interval
 
         # ---------- projectiles post‑attack ----------
         alive_mask = [u.is_alive() for _, u in self.units]
@@ -574,6 +830,37 @@ class MTEnv:
             return True
         return False
 
+    def _can_progress(self, who: int) -> bool:
+        """Return True if player can still make forward deploy moves
+        (BUY_PLACE, PLACE_FROM_BENCH, MERGE). SELL is excluded so we don't
+        loop forever in deploy.
+        """
+        pl = self.p0 if who == 0 else self.p1
+
+        # BUY or PLACE_FROM_BENCH needs capacity + empty back cell
+        if self._board_count(who) < self._cap():
+            # BUY
+            for si in range(len(pl.shop)):
+                if self._can_buy_from_slot(who, si):
+                    return True
+            # PLACE_FROM_BENCH
+            if pl.bench and self._has_empty_back_cell(who):
+                return True
+
+        # MERGE (adjacent, same id/star)
+        owned = list(pl.units.keys())
+        for i in range(len(owned)):
+            for j in range(i + 1, len(owned)):
+                p1 = owned[i]; p2 = owned[j]
+                u1 = pl.units[p1]; u2 = pl.units[p2]
+                if (_unit_id(u1) == _unit_id(u2)
+                    and u1.star == u2.star
+                    and u1.star < 3
+                    and abs(p1[0]-p2[0]) + abs(p1[1]-p2[1]) == 1):
+                    return True
+
+        return False
+
     # -------------- gym-like API --------------
     def reset(self, seed: Optional[int]=None):
         if seed is not None:
@@ -586,6 +873,7 @@ class MTEnv:
         self.p0 = PlayerState(elixir=rules.START_ELIXIR)
         self.p1 = PlayerState(elixir=rules.START_ELIXIR)
         self.last_info = {}
+        self._battle_replay_seed: Optional[list] = None
 
         # (Re)bind catalog for Unit.from_card safety
         self._bind_catalog()
@@ -727,7 +1015,8 @@ class MTEnv:
         if atype == "END":
             pl.actions_left = 0
         else:
-            pl.actions_left = 1 if self._can_any_action(who) else 0
+            # Only keep deploy alive if a forward action is possible (exclude SELL).
+            pl.actions_left = 1 if self._can_progress(who) else 0
 
         # If both done -> battle
         if self.p0.actions_left == 0 and self.p1.actions_left == 0:
@@ -750,8 +1039,32 @@ class MTEnv:
         units = []
         for pos, u in self.p0.units.items():
             units.append([0, _unit_make(card_or_troop_id=_unit_id(u), star=u.star, pos=(pos[0], pos[1]))])
+            try:
+                unit = units[-1][1]
+                unit._origin_pos = (int(pos[0]), int(pos[1]))
+                unit._origin_card = int(_unit_id(u))
+                unit._origin_star = int(getattr(u, "star", 1))
+            except Exception:
+                pass
         for pos, u in self.p1.units.items():
             units.append([1, _unit_make(card_or_troop_id=_unit_id(u), star=u.star, pos=(pos[0], pos[1]))])
+            try:
+                unit = units[-1][1]
+                unit._origin_pos = (int(pos[0]), int(pos[1]))
+                unit._origin_card = int(_unit_id(u))
+                unit._origin_star = int(getattr(u, "star", 1))
+            except Exception:
+                pass
+        self._battle_replay_seed = [
+            {
+                "owner": owner,
+                "card_id": _unit_id(unit),
+                "star": int(getattr(unit, "star", 1)),
+                "pos": (float(unit.pos[0]), float(unit.pos[1])),
+                "hp": float(getattr(unit, "hp", 1.0)),
+            }
+            for owner, unit in units
+        ]
         engine = BattleEngine(units=units)
 
         t = 0.0
@@ -791,11 +1104,56 @@ class MTEnv:
         self.p0.units.clear()
         self.p1.units.clear()
         for owner, unit in engine.units:
-            pos = (int(round(unit.pos[0])), int(round(unit.pos[1])))
+            origin = getattr(unit, "_origin_pos", None)
+            card = getattr(unit, "_origin_card", _unit_id(unit))
+            star = getattr(unit, "_origin_star", getattr(unit, "star", 1))
+            if origin is None:
+                origin = (int(round(unit.pos[0])), int(round(unit.pos[1])))
+            r, c = int(origin[0]), int(origin[1])
+            revived = _unit_make(card, int(star), (r, c))
+            revived.pos = (float(r), float(c))
             if owner == 0:
-                self.p0.units[pos] = unit
+                self.p0.units[(r, c)] = revived
             elif owner == 1:
-                self.p1.units[pos] = unit
+                self.p1.units[(r, c)] = revived
+
+        # --- Post-battle cleanup / reset ---
+        # Always clear motion/cooldowns and snap to centers
+        def _cleanup_units(udict: Dict[Tuple[int,int], Unit]):
+            for pos, u in list(udict.items()):
+                r, c = int(round(u.pos[0])), int(round(u.pos[1]))
+                u.pos = (float(r), float(c))
+                if hasattr(u, "move_target"):
+                    u.move_target = None
+                try:
+                    u.cooldown = 0.0
+                except Exception:
+                    pass
+        _cleanup_units(self.p0.units)
+        _cleanup_units(self.p1.units)
+
+        # Optional: reset surviving units to their back rows for the next round
+        # (useful for clean visual resets). Controlled by rules.RESET_POSITIONS_AFTER_BATTLE.
+        if getattr(rules, "RESET_POSITIONS_AFTER_BATTLE", False):
+            def _reset_to_back(udict: Dict[Tuple[int,int], Unit], who: int):
+                back_row = 0 if who == 0 else rules.BOARD_ROWS - 1
+                # Repack by increasing column, skipping occupied
+                newmap: Dict[Tuple[int,int], Unit] = {}
+                col = 0
+                for _old_pos, u in sorted(udict.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+                    # find next free column on back row
+                    while col < rules.BOARD_COLS and ((back_row, col) in newmap):
+                        col += 1
+                    if col >= rules.BOARD_COLS:
+                        break
+                    u.pos = (float(back_row), float(col))
+                    newmap[(back_row, col)] = u
+                    col += 1
+                udict.clear()
+                udict.update(newmap)
+
+            _reset_to_back(self.p0.units, 0)
+            _reset_to_back(self.p1.units, 1)
 
         self.in_battle = False
         self.p0.base_hp = max(0, self.p0.base_hp)

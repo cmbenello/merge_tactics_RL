@@ -343,9 +343,46 @@ def parse_traits(soup: BeautifulSoup) -> dict:
 
     return {}
 
+def clean_title(title: str) -> str:
+    """
+    Normalize a wiki page title by removing trailing Merge Tactics qualifiers.
+    Examples removed:
+      "Archers (Merge Tactics)"
+      "Archers – Merge Tactics"
+      "Archers - Merge Tactics"
+    """
+    t = title or ""
+    # Remove parenthetical "(Merge Tactics)" (allow space or underscore)
+    t = re.sub(r"\s*\(Merge[_ ]?Tactics\)\s*$", "", t, flags=re.I)
+    # Remove dash-separated " - Merge Tactics" or " – Merge Tactics"
+    t = re.sub(r"\s*[-–—]\s*Merge[_ ]?Tactics\s*$", "", t, flags=re.I)
+    return t.strip()
+
+# --- Helper: extract numeric range in tiles (if present), else None ---
+def _range_value(v):
+    """Return a numeric float range in tiles if available, else None.
+    Accepts either a dict like {"value": x, "unit": "tiles"} or a raw number/string.
+    """
+    try:
+        if isinstance(v, dict):
+            if "value" in v:
+                return float(v["value"])
+        # occasionally our parser may have stored a plain number
+        if isinstance(v, (int, float)):
+            return float(v)
+        # last resort: try to parse a stray string
+        if isinstance(v, str):
+            m = NUM_RE.search(v.replace(",", ""))
+            if m:
+                return float(m.group(0))
+    except Exception:
+        pass
+    return None
+
 def parse_unit_page(url: str) -> dict:
     soup = fetch(url)
     title = norm_space(soup.select_one("#firstHeading").get_text(" ")) if soup.select_one("#firstHeading") else url
+    title = clean_title(title)
     data = {"name": title, "url": url}
     # include removed/legacy status if present
     data.update(detect_removed_notice(soup))
@@ -359,7 +396,19 @@ def parse_unit_page(url: str) -> dict:
     per_level = parse_star_tables(soup)
     if per_level:
         data["per_level"] = per_level
-    # simple type heuristic if missing
+    # Infer/override melee vs ranged from numeric range when available.
+    r_tiles = _range_value(data.get("range"))
+    if r_tiles is not None:
+        if r_tiles <= 1.0001:
+            # Range 1 -> treat as melee regardless of wording on the page.
+            data["type"] = "Melee"
+            # It can help downstream to know melee has no projectile.
+            # Only set a default when not already present.
+            data.setdefault("projectile_speed", 0.0)
+        else:
+            # If not already labeled, mark as ranged.
+            data.setdefault("type", "Ranged")
+    # Textual fallback only if still unknown after numeric inference
     if "type" not in data:
         body = soup.select_one("#mw-content-text")
         txt = lower(body.get_text(" ")) if body else ""

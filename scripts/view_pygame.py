@@ -1,11 +1,17 @@
-import os, sys, time, math
+import os, sys, time, math, re
 import pygame
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
-from mergetactics.env import MTEnv, BattleEngine, Projectile
+from mergetactics.env import MTEnv, BattleEngine, Projectile, _unit_make
 from mergetactics.bots import GreedyBot, RandomBot
 from mergetactics import rules
 from mergetactics.entities import Unit
+
+# Force-enable projectiles in the viewer (env respects rules.USE_PROJECTILES)
+try:
+    setattr(rules, "USE_PROJECTILES", True)
+except Exception:
+    pass
 
 # ==============================
 # Layout / sizing
@@ -40,13 +46,14 @@ HP_BAR = (120, 230, 120)
 ELIXIR_BAR = (140, 120, 255)
 
 # Trait palette (lightly opinionated; fallback if you haven’t wired real traits yet)
-TRAIT_COLORS = {
+DEFAULT_TRAIT_COLORS = {
     'Undead': (120, 240, 160),
     'Ranger': (130, 170, 255),
     'Goblin': (110, 210, 110),
     'Royal': (245, 210, 90),
     'Avenger': (250, 120, 160),
 }
+TRAIT_COLORS = {**DEFAULT_TRAIT_COLORS, **getattr(rules, "TRAIT_COLORS", {})}
 DEFAULT_CARD_FG = (200, 200, 210)
 DEFAULT_CARD_BG = (50, 54, 70)
 
@@ -83,6 +90,8 @@ END_ONLY_ON_WIPE = getattr(rules, "END_ONLY_ON_WIPE", False)
 # Runtime speed controls
 SPEED_MULT = 1.0
 DEPLOY_DELAY_MS_DEFAULT = 250
+BATTLE_BASE_SPEED = 3.0        # additional substeps per frame for faster battles
+PROJECTILE_SPEED_SCALE = 0.75  # viewer-only projectile slow-down (1.0 = stock)
 
 ARCHER = getattr(rules, 'ARCHER', 1)
 TANK = getattr(rules, 'TANK', 0)
@@ -102,9 +111,22 @@ def cell_rect(r, c):
     return pygame.Rect(int(cx - HEX_W/2), int(cy - HEX_H/2), int(HEX_W), int(HEX_H))
 
 def pos_to_px(rf, cf):
-    # fractional hex coordinates -> interpolate centers
-    # treat rf, cf as continuous in same lattice; use nearest centers for simplicity
-    return hex_center((int(round(rf)), int(round(cf))))
+    """Map continuous odd‑r (row, col) to pixel center smoothly.
+    We linearly interpolate the half‑column offset between neighbouring rows
+    so moving across rows doesn’t cause jumps (the classic odd‑r discontinuity).
+    """
+    bx, by = board_origin()
+    r = float(rf); c = float(cf)
+    r0 = math.floor(r)
+    r1 = r0 + 1
+    alpha = r - r0  # blend toward next row
+    # odd‑r offset (0 for even rows, 0.5 for odd rows), blended across rows
+    off0 = 0.5 if (r0 & 1) else 0.0
+    off1 = 0.5 if (r1 & 1) else 0.0
+    off = (1.0 - alpha) * off0 + alpha * off1
+    x = bx + HEX_W * (c + off) + HEX_W * 0.75
+    y = by + HEX_VSTEP * r + HEX_R * 1.1
+    return int(x), int(y)
 
 def draw_grid(surf):
     for r in range(BOARD_H):
@@ -131,6 +153,41 @@ def _traits_for_tid(tid):
     traits_map = getattr(rules, 'CARD_TRAITS', {})
     return traits_map.get(tid, [])
 
+def _color_for_trait(name):
+    if not name:
+        return None
+    candidates = [name, name.lower(), name.title(), re.sub(r"\s+cards$", "", name, flags=re.I).strip()]
+    candidates += [c.lower() for c in candidates]
+    for key in candidates:
+        if key in TRAIT_COLORS:
+            return TRAIT_COLORS[key]
+    return None
+
+def _primary_trait_color(tid):
+    for trait in _traits_for_tid(tid):
+        color = _color_for_trait(trait)
+        if color:
+            return color
+    return None
+
+def _blend_color(base, overlay, alpha=0.5):
+    ax = max(0.0, min(1.0, alpha))
+    return tuple(int((1-ax)*base[i] + ax*overlay[i]) for i in range(3))
+
+def _cost_for_tid(tid):
+    try:
+        catalog = getattr(rules, 'CARD_CATALOG', None)
+        card = None
+        if isinstance(catalog, (list, tuple)) and 0 <= tid < len(catalog):
+            card = catalog[tid]
+        elif isinstance(catalog, dict):
+            card = catalog.get(tid)
+        if card is not None:
+            return int(rules.elixir_cost_for(card))
+    except Exception:
+        pass
+    return getattr(rules, "CARD_COST_DEFAULT", 3)
+
 
 def _name_for_tid(tid):
     names = getattr(rules, 'TROOP_NAMES', {})
@@ -138,23 +195,43 @@ def _name_for_tid(tid):
 
 
 def card_chip(surf, rect, tid, font_small, font_big):
-    # Background
-    pygame.draw.rect(surf, TILE_BG, rect, border_radius=10)
+    pygame.draw.rect(surf, DEFAULT_CARD_BG, rect, border_radius=10)
     pygame.draw.rect(surf, TILE_BORDER, rect, width=2, border_radius=10)
 
-    # Trait ribbons (up to two)
+    # Trait squares in top-left corner
     traits = _traits_for_tid(tid)
+    trait_colors = [_color_for_trait(t) for t in traits if _color_for_trait(t)]
+    inner = rect.inflate(-12, -12)
+    if trait_colors and inner.w > 0 and inner.h > 0:
+        count = min(2, len(trait_colors))
+        box_size = max(6, min(10, inner.h // 7))
+        spacing = max(2, min(5, inner.w // 20))
+        total_width = count * box_size + (count - 1) * spacing
+        start_x = inner.x + 3
+        if start_x + total_width > inner.right - 3:
+            start_x = inner.right - total_width - 3
+        y = inner.y + 3
+        pygame.draw.rect(surf, DEFAULT_CARD_BG, (start_x - 2, y - 2, total_width + 4, box_size + 4), border_radius=3)
+        for idx, color in enumerate(trait_colors[:count]):
+            box = pygame.Rect(start_x + idx * (box_size + spacing), y, box_size, box_size)
+            pygame.draw.rect(surf, color, box, border_radius=2)
+
+    # Trait ribbons (up to two)
     sw = max(8, rect.w // 8)
     x0 = rect.x + 6
     for k, t in enumerate(traits[:2]):
-        c = TRAIT_COLORS.get(t, DEFAULT_CARD_BG)
+        c = _color_for_trait(t) or DEFAULT_CARD_BG
         rr = pygame.Rect(x0 + k*(sw+4), rect.y + 6, sw, 16)
         pygame.draw.rect(surf, c, rr, border_radius=3)
 
     # Name label
     nm = _name_for_tid(tid)
     label = font_small.render(nm, True, DEFAULT_CARD_FG)
+    # clip to tile width
+    clip = surf.get_clip()
+    surf.set_clip(rect.inflate(-10, -10))
     surf.blit(label, (rect.x + 8, rect.y + rect.h//2 - label.get_height()//2))
+    surf.set_clip(clip)
 
 
 def draw_store_row(surf, font_small, font_big, items, owner=0):
@@ -169,7 +246,7 @@ def draw_store_row(surf, font_small, font_big, items, owner=0):
 
     # Render 3 slots
     slot_w = (bg.w - 24 - 2*12) // 3
-    slot_h = 72
+    slot_h = 86
     sy = y + 28
     for i in range(3):
         rect = pygame.Rect(x + i*(slot_w+12), sy, slot_w, slot_h)
@@ -185,6 +262,10 @@ def draw_store_row(surf, font_small, font_big, items, owner=0):
             else:
                 tid = itm
             card_chip(surf, rect, tid, font_small, font_big)
+            # Cost label bottom-right
+            cost = _cost_for_tid(int(tid))
+            label = font_small.render(f"{cost} elixir", True, SUBTLE)
+            surf.blit(label, (rect.right - label.get_width() - 8, rect.bottom - label.get_height() - 6))
 
 
 def draw_bench_column(surf, font_small, font_big, items, owner=0, hp=None, elixir=None):
@@ -197,13 +278,31 @@ def draw_bench_column(surf, font_small, font_big, items, owner=0, hp=None, elixi
     title = f"P{owner} Bench"
     draw_text(surf, font_big, title, x + 12, 10)
 
-    # Show HP/Elixir bars under title
+    # Show King HP as a bar + number, and Elixir as a number (no bar)
     if hp is None:
         hp = 10
     if elixir is None:
         elixir = 0
-    draw_bar(surf, x+12, 40, SIDE_W-24, 12, hp/10.0, HP_BAR)
-    draw_bar(surf, x+12, 58, SIDE_W-24, 10, elixir/max(1, getattr(rules,'START_ELIXIR',4)), ELIXIR_BAR)
+
+    # Determine max king HP if exposed in rules, else default to 10
+    king_hp_max = getattr(rules, 'KING_HP_MAX', 10)
+    hp_frac = float(hp) / max(1.0, float(king_hp_max))
+
+    # King HP bar
+    hp_bar_x = x + 12
+    hp_bar_w = SIDE_W - 24
+    hp_bar_y = 40
+    draw_bar(surf, hp_bar_x, hp_bar_y, hp_bar_w, 12, hp_frac, HP_BAR)
+
+    # King HP number overlay (e.g., "HP: 8/10")
+    hp_text = f"HP: {int(hp)}/{int(king_hp_max)}"
+    txt = font_small.render(hp_text, True, WHITE)
+    surf.blit(txt, (hp_bar_x, hp_bar_y - txt.get_height() - 2))
+
+    # Elixir as a number (no bar)
+    elixir_text = f"Elixir: {int(elixir)}"
+    etxt = font_small.render(elixir_text, True, SUBTLE)
+    surf.blit(etxt, (x + 12, 58))
 
     # Slots (vertical list)
     slot_w = SIDE_W - 24
@@ -230,13 +329,245 @@ def draw_bench_column(surf, font_small, font_big, items, owner=0, hp=None, elixi
 # ==============================
 
 def build_engine_from_env(env):
+    """
+    Build a BattleEngine snapshot from the deploy state without losing
+    catalog-derived fields (range, projectile speed, etc.).
+    We (re)bind Unit to the active catalog/level and prefer to clone the
+    existing Unit objects when possible.
+    """
+    # 1) Rebind Unit to the same catalog/level that env uses (if present)
+    _rebind_unit_catalog(env)
+
+    def _clone_or_rebuild(src_u, pos):
+        # Prefer a simple field-wise clone if constructor allows (hp, star, pos preserved)
+        try:
+            # Some versions expose a copy/clone; use it if available.
+            if hasattr(src_u, "clone"):
+                v = src_u.clone()
+                v.pos = (float(pos[0]), float(pos[1]))
+                base_hp = float(getattr(v, "_viewer_max_hp", getattr(v, "hp", 1.0)))
+                setattr(v, "_viewer_max_hp", base_hp)
+                return v
+        except Exception:
+            pass
+        # Fallback: rebuild from catalog/card id
+        cid = getattr(src_u, "card_id", getattr(src_u, "troop_id", 0))
+        star = getattr(src_u, "star", 1)
+        try:
+            v = Unit.from_card(card_id=cid, star=star, pos=(pos[0], pos[1]))
+        except Exception:
+            # very old fallback: from_troop(troop_id=..., ...)
+            try:
+                v = Unit.from_troop(troop_id=cid, star=star, pos=(pos[0], pos[1]))
+            except Exception:
+                # Last resort: shallow shim with minimal attributes
+                v = Unit.from_card(card_id=cid, star=star, pos=(pos[0], pos[1]))
+        base_hp = float(getattr(v, "hp", 1.0))
+        # carry over current HP if the deploy phase modified it (should be full in most cases)
+        try:
+            if hasattr(src_u, "hp"):
+                v.hp = float(src_u.hp)
+        except Exception:
+            pass
+        _apply_projectile_speed_scale(v)
+        setattr(v, "_viewer_max_hp", base_hp)
+        return v
+
     units = []
     for pos, u in env.p0.units.items():
-        cid = getattr(u, 'card_id', getattr(u, 'troop_id', 0))
-        units.append([0, Unit.from_card(card_id=cid, star=getattr(u, 'star', 1), pos=(pos[0], pos[1]))])
+        units.append([0, _clone_or_rebuild(u, pos)])
     for pos, u in env.p1.units.items():
-        cid = getattr(u, 'card_id', getattr(u, 'troop_id', 0))
-        units.append([1, Unit.from_card(card_id=cid, star=getattr(u, 'star', 1), pos=(pos[0], pos[1]))])
+        units.append([1, _clone_or_rebuild(u, pos)])
+    return BattleEngine(units=units)
+
+
+def build_engine_from_seed(env):
+    """Rebuild a BattleEngine using env._battle_replay_seed if available."""
+    seed = getattr(env, "_battle_replay_seed", None)
+    if not seed:
+        return None
+    _rebind_unit_catalog(env)
+    units = []
+    for entry in seed:
+        try:
+            owner = int(entry.get("owner", 0))
+            cid = int(entry.get("card_id"))
+        except Exception:
+            continue
+        star = int(entry.get("star", 1))
+        pos = entry.get("pos", (0, 0))
+        if not isinstance(pos, (tuple, list)) or len(pos) != 2:
+            pos = (0, 0)
+        r, c = float(pos[0]), float(pos[1])
+        unit = _unit_make(card_or_troop_id=cid, star=star, pos=(r, c))
+        base_hp = float(getattr(unit, "hp", 1.0))
+        hp_override = entry.get("hp")
+        if hp_override is not None:
+            try:
+                unit.hp = float(hp_override)
+            except Exception:
+                pass
+        _apply_projectile_speed_scale(unit)
+        setattr(unit, "_viewer_max_hp", base_hp)
+        units.append([owner, unit])
+    return BattleEngine(units=units)
+
+
+def _rebind_unit_catalog(env):
+    """Ensure Unit has the same catalog/level bindings as the env."""
+    try:
+        catalog = getattr(env, "catalog", None)
+        level = getattr(env, "unit_level", None)
+        if catalog is not None and hasattr(Unit, "bind_catalog"):
+            if level is not None:
+                Unit.bind_catalog(catalog, level=level)
+            else:
+                Unit.bind_catalog(catalog)
+    except TypeError:
+        try:
+            Unit.bind_catalog(catalog)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _snapshot_units(units_dict):
+    """Capture card_id, star, and hp for each board position.
+    Dead units (hp <= 0) are ignored so battles don't start in a wiped state.
+    """
+    snap = {}
+    for (r, c), u in units_dict.items():
+        cid = getattr(u, "card_id", getattr(u, "troop_id", 0))
+        star = int(getattr(u, "star", 1))
+        try:
+            hp = float(getattr(u, "hp", 1.0))
+        except Exception:
+            hp = 1.0
+        if hp <= 0.0:
+            continue
+        snap[(int(r), int(c))] = {"id": int(cid), "star": star, "hp": hp}
+    return snap
+
+
+def _normalize_bench(items):
+    """Return a list of (card_id, star) tuples from arbitrary bench entries."""
+    out = []
+    for itm in items:
+        if isinstance(itm, dict):
+            cid = itm.get("card_id", itm.get("troop_id", itm.get("id", 0)))
+            star = itm.get("star", itm.get("level", 1))
+        elif isinstance(itm, (list, tuple)):
+            cid = itm[0] if itm else 0
+            star = itm[1] if len(itm) > 1 else 1
+        else:
+            cid = itm
+            star = 1
+        out.append((int(cid), int(star)))
+    return out
+
+
+def _apply_projectile_speed_scale(unit):
+    """Slow projectiles for viewer visualization only."""
+    scale = PROJECTILE_SPEED_SCALE
+    if scale == 1.0:
+        return
+    if scale <= 0.0:
+        return
+    if getattr(unit, "_viewer_proj_scaled", False):
+        return
+    try:
+        attr = getattr(unit, "projectile_speed", None)
+    except Exception:
+        return
+    if attr is None:
+        return
+
+    try:
+        if callable(attr):
+            def _scaled(attr=attr, scale=scale):
+                try:
+                    val = attr()
+                except Exception:
+                    return 0.0
+                try:
+                    val_f = float(val)
+                except Exception:
+                    return val
+                if val_f <= 0.0:
+                    return val_f
+                return val_f * scale
+            setattr(unit, "projectile_speed", _scaled)
+        else:
+            val = float(attr)
+            if val <= 0.0:
+                return
+            setattr(unit, "projectile_speed", val * scale)
+        setattr(unit, "_viewer_proj_scaled", True)
+    except Exception:
+        pass
+
+
+def _apply_action_to_snapshot(snapshot, action, actor):
+    """Mutate snapshot in-place to reflect the deploy action that just executed."""
+    atype, args = action
+    player_units = snapshot["units"][actor]
+    benches = snapshot["benches"][actor]
+    shops = snapshot["shops"][actor]
+    back_row = 0 if actor == 0 else rules.BOARD_ROWS - 1
+
+    def _pos_tuple(pos):
+        if isinstance(pos, (list, tuple)) and len(pos) == 2:
+            return (int(pos[0]), int(pos[1]))
+        return (int(pos), 0)
+
+    if atype == "BUY_PLACE":
+        si, col = args
+        if 0 <= si < len(shops):
+            cid = shops[si]
+            pos = (back_row, int(col))
+            player_units[pos] = {"id": int(cid), "star": 1, "hp": None}
+    elif atype == "PLACE_FROM_BENCH":
+        bi, col = args
+        if 0 <= bi < len(benches):
+            cid, star = benches[bi]
+            pos = (back_row, int(col))
+            player_units[pos] = {"id": int(cid), "star": int(star), "hp": None}
+    elif atype == "SELL":
+        (pos,) = args
+        player_units.pop(_pos_tuple(pos), None)
+    elif atype == "MERGE":
+        p1, p2 = args
+        p1 = _pos_tuple(p1)
+        p2 = _pos_tuple(p2)
+        u1 = player_units.get(p1)
+        u2 = player_units.get(p2)
+        if u1 and u2 and u1["id"] == u2["id"]:
+            player_units[p1] = {"id": int(u1["id"]), "star": int(u1["star"]) + 1, "hp": None}
+            player_units.pop(p2, None)
+    # END or unknown actions do not alter board layout
+
+
+def build_engine_from_snapshot(env, snapshot, action, actor):
+    """Construct a BattleEngine from the deploy snapshot and the last action."""
+    _rebind_unit_catalog(env)
+    _apply_action_to_snapshot(snapshot, action, actor)
+    units = []
+    for owner in (0, 1):
+        for pos, data in snapshot["units"][owner].items():
+            r, c = pos
+            cid = data["id"]
+            star = data["star"]
+            unit = _unit_make(card_or_troop_id=cid, star=star, pos=(r, c))
+            base_hp = float(getattr(unit, "hp", 1.0))
+            if data.get("hp") is not None:
+                try:
+                    unit.hp = float(data["hp"])
+                except Exception:
+                    pass
+            _apply_projectile_speed_scale(unit)
+            setattr(unit, "_viewer_max_hp", base_hp)
+            units.append([owner, unit])
     return BattleEngine(units=units)
 
 
@@ -271,17 +602,41 @@ def draw_unit(surf, unit, owner, font_small=None):
     cx, cy = pos_to_px(unit.pos[0], unit.pos[1])
     color = P0C if owner == 0 else P1C
 
-    # Shape: melee = circle, ranged = diamond (based on projectile speed)
-    try:
-        is_ranged = float(unit.projectile_speed()) > 0.0
-    except Exception:
-        is_ranged = False
+    # Shape: melee = circle, ranged = diamond.
+    # Consider a unit "ranged" if it either has projectile_speed > 0
+    # OR its range (in tiles) is >= 2. We handle both callables and raw values,
+    # and also dict-like values from the scraper (e.g., {"value": 3, "unit": "tiles"}).
+    def _num(x):
+        try:
+            if isinstance(x, dict) and "value" in x:
+                return float(x["value"])
+            return float(x)
+        except Exception:
+            return 0.0
+
+    def _val(attr, default):
+        try:
+            v = getattr(unit, attr, default)
+            return v() if callable(v) else v
+        except Exception:
+            return default
+
+    rng_tiles = _num(_val("range", 1))
+    proj_speed = _num(_val("projectile_speed", 0))
+    is_ranged = (proj_speed > 0.0) or (rng_tiles >= 2.0)
     if not is_ranged:
         pygame.draw.circle(surf, color, (cx, cy), int(HEX_R * 0.71))
     else:
         s = int(HEX_R * 0.66)
         pts = [(cx, cy-s), (cx+s, cy), (cx, cy+s), (cx-s, cy)]
         pygame.draw.polygon(surf, color, pts)
+
+    # Show unit name above icon
+    if font_small is not None:
+        nm = rules.TROOP_NAMES.get(getattr(unit, 'card_id', getattr(unit, 'troop_id', -1)), "")
+        if nm:
+            name_label = font_small.render(nm, True, SUBTLE)
+            surf.blit(name_label, (cx - name_label.get_width()//2, cy - int(HEX_R*1.25)))
 
     # star pips
     pip = int(HEX_R * 0.14)
@@ -291,11 +646,13 @@ def draw_unit(surf, unit, owner, font_small=None):
         pygame.draw.circle(surf, WHITE, (start_x + i*gap, cy - int(HEX_R * 0.95)), pip)
 
     # hp bar
-    max_hp = (
-        getattr(unit, 'max_hp', None)
-        or getattr(unit, 'hp_max', None)
-        or getattr(unit, '_max_hp', None)
-    )
+    max_hp = getattr(unit, "_viewer_max_hp", None)
+    if max_hp is None:
+        max_hp = (
+            getattr(unit, 'max_hp', None)
+            or getattr(unit, 'hp_max', None)
+            or getattr(unit, '_max_hp', None)
+        )
     if max_hp is None:
         try:
             max_hp = max(1.0, float(getattr(unit, 'hp', 1.0)))
@@ -303,6 +660,10 @@ def draw_unit(surf, unit, owner, font_small=None):
             max_hp = 1.0
     cur_hp = float(getattr(unit, 'hp', 0.0))
     ratio = 0.0 if max_hp <= 0 else (cur_hp / float(max_hp))
+    if ratio < 0.0:
+        ratio = 0.0
+    elif ratio > 1.0:
+        ratio = 1.0
     hp_w = int(ratio * (HEX_W * 0.55))
     bar_x = cx - int(HEX_W * 0.275)
     bar_y = cy + int(HEX_R * 0.8)
@@ -352,9 +713,9 @@ def visualize_deploy(screen, font_big, font_small, env, b0, b1, delay_ms=DEPLOY_
         for (r,c), u in env.p1.units.items():
             draw_unit(screen, u, 1, font_small)
 
-        # footer deploy hint centered over board bottom
+        # footer deploy hint centered under board
         bx, by = board_origin()
-        draw_text(screen, font_small, f"Action: {action_text}   (± to change speed, SPACE pause)", bx, by + CELL*BOARD_H + 8)
+        draw_text(screen, font_small, f"Action: {action_text}   (± to change speed, SPACE pause)", bx, by + int(BOARD_PIXEL_H) + 8)
 
         pygame.display.flip()
 
@@ -382,24 +743,57 @@ def visualize_deploy(screen, font_big, font_small, env, b0, b1, delay_ms=DEPLOY_
         clock.tick(60)
         pygame.time.delay(delay_ms)
 
-        # snapshot before stepping so we can animate that battle state
-        pre_p0_units = {pos: (getattr(u, 'card_id', getattr(u, 'troop_id', 0)), getattr(u, 'star', 1)) for pos, u in env.p0.units.items()}
-        pre_p1_units = {pos: (getattr(u, 'card_id', getattr(u, 'troop_id', 0)), getattr(u, 'star', 1)) for pos, u in env.p1.units.items()}
+        # Snapshot full deploy state so we can rebuild the battle board if this action ends deploy.
+        snapshot = {
+            "units": {
+                0: _snapshot_units(env.p0.units),
+                1: _snapshot_units(env.p1.units),
+            },
+            "shops": {
+                0: list(getattr(env.p0, 'shop', [])),
+                1: list(getattr(env.p1, 'shop', [])),
+            },
+            "benches": {
+                0: _normalize_bench(getattr(env.p0, 'bench', [])),
+                1: _normalize_bench(getattr(env.p1, 'bench', [])),
+            },
+        }
 
         # choose & step
         bot = b0 if env.turn == 0 else b1
         action = bot.act(obs, mask)
         action_text = f"P{env.turn} -> {action[0]} {action[1]}"
+        # Immediate feedback of chosen action in HUD
+        screen.fill(BG)
+        draw_store_row(screen, font_small, font_big, obs.get('p0_shop', []), owner=0)
+        draw_store_row(screen, font_small, font_big, obs.get('p1_shop', []), owner=1)
+        draw_bench_column(screen, font_small, font_big, getattr(env.p0, 'bench', []), owner=0,
+                          hp=getattr(env.p0, 'base_hp', 10), elixir=getattr(env.p0, 'elixir', 0))
+        draw_bench_column(screen, font_small, font_big, getattr(env.p1, 'bench', []), owner=1,
+                          hp=getattr(env.p1, 'base_hp', 10), elixir=getattr(env.p1, 'elixir', 0))
+        draw_grid(screen)
+        for (r,c), u in env.p0.units.items():
+            draw_unit(screen, u, 0, font_small)
+        for (r,c), u in env.p1.units.items():
+            draw_unit(screen, u, 1, font_small)
+        bx, by = board_origin()
+        draw_text(screen, font_small, f"Action: {action_text}   (± to change speed, SPACE pause)", bx, by + int(BOARD_PIXEL_H) + 8)
+        pygame.display.flip()
         prev_round = env.round
+        actor = env.turn
         obs, mask, reward, done, info = env_step_with_mask(env, action)
 
-        if (env.p0.actions_left == 0 and env.p1.actions_left == 0) or (env.round > prev_round):
-            units = []
-            for (r,c), (tid, star) in pre_p0_units.items():
-                units.append([0, Unit.from_card(card_id=tid, star=star, pos=(r, c))])
-            for (r,c), (tid, star) in pre_p1_units.items():
-                units.append([1, Unit.from_card(card_id=tid, star=star, pos=(r, c))])
-            return BattleEngine(units=units)
+        if env.round > prev_round:
+            seeded = build_engine_from_seed(env)
+            if seeded is not None:
+                return seeded
+            return build_engine_from_snapshot(env, snapshot, action, actor)
+
+        if env.p0.actions_left == 0 and env.p1.actions_left == 0:
+            seeded = build_engine_from_seed(env)
+            if seeded is not None:
+                return seeded
+            return build_engine_from_snapshot(env, snapshot, action, actor)
 
     return None
 
@@ -414,6 +808,11 @@ def visualize_battle(screen, font_big, font_small, env, speed=1.0, engine=None):
     global SPEED_MULT
 
     def wrap_step(dt):
+        # Step the engine; ensure projectiles are on for rendering
+        try:
+            setattr(rules, "USE_PROJECTILES", True)
+        except Exception:
+            pass
         before = len(engine.projectiles)
         engine.step(dt)
         after = len(engine.projectiles)
@@ -447,7 +846,7 @@ def visualize_battle(screen, font_big, font_small, env, speed=1.0, engine=None):
         if p0_alive == 0 or p1_alive == 0:
             break
 
-        substeps = max(1, int(speed * SPEED_MULT))
+        substeps = max(1, int(speed * SPEED_MULT * BATTLE_BASE_SPEED))
         for _ in range(substeps):
             wrap_step(dt)
             t += dt
@@ -472,13 +871,13 @@ def visualize_battle(screen, font_big, font_small, env, speed=1.0, engine=None):
         draw_grid(screen)
         for owner, u in engine.units:
             if u.is_alive():
-                draw_unit(screen, u, owner)
+                draw_unit(screen, u, owner, font_small)
         for p in engine.projectiles:
             draw_projectile(screen, p)
 
         # footer status
         bx, by = board_origin()
-        draw_text(screen, font_small, f"BATTLE t={t:0.1f}s  Alive P0={p0_alive} P1={p1_alive}  (SPACE pause, 1..5 speed, F ffwd)", bx, by + CELL*BOARD_H + 8)
+        draw_text(screen, font_small, f"BATTLE t={t:0.1f}s  Alive P0={p0_alive} P1={p1_alive}  (SPACE pause, 1..5 speed, F ffwd)", bx, by + int(BOARD_PIXEL_H) + 8)
 
         pygame.display.flip()
         for ev in pygame.event.get():
